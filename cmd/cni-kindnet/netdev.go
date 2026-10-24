@@ -392,24 +392,36 @@ func getDefaultGwInterfaceMTU() int {
 	filter := &netlink.Route{
 		Table: unix.RT_TABLE_MAIN,
 	}
-	routes, err := netlink.RouteListFiltered(netlink.FAMILY_ALL, filter, netlink.RT_FILTER_TABLE)
-	if err != nil && !errors.Is(err, unix.EINTR) {
-		return 0
-	}
-
-	minMetricV4 := math.MaxInt32
-	minMetricV6 := math.MaxInt32
-
-	var bestLinkV4 int
-	var bestLinkV6 int
-	hasV4 := false
-	hasV6 := false
-
-	for _, r := range routes {
-		if r.Family != netlink.FAMILY_V4 && r.Family != netlink.FAMILY_V6 {
+	// Dump one family at a time. The dump of all families always runs under
+	// RTNL, while since Linux 6.9 (IPv4) and 6.10 (IPv6) the dump of one
+	// family does not. IPv4 is preferred, so the IPv6 routes are only read
+	// without an IPv4 default route.
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		routes, err := netlink.RouteListFiltered(family, filter, netlink.RT_FILTER_TABLE)
+		if err != nil && !errors.Is(err, unix.EINTR) {
+			return 0
+		}
+		bestLink, ok := defaultRouteLink(routes)
+		if !ok {
 			continue
 		}
+		intfLink, err := netlink.LinkByIndex(bestLink)
+		if err != nil {
+			return 0
+		}
+		return intfLink.Attrs().MTU
+	}
+	return 0
+}
 
+// defaultRouteLink returns the link of the default route with the lowest
+// metric, routes must belong to a single family.
+func defaultRouteLink(routes []netlink.Route) (int, bool) {
+	minMetric := math.MaxInt32
+	var bestLink int
+	found := false
+
+	for _, r := range routes {
 		if r.Dst != nil {
 			ones, bits := r.Dst.Mask.Size()
 			if !r.Dst.IP.IsUnspecified() || ones != 0 || (bits != 32 && bits != 128) {
@@ -426,33 +438,11 @@ func getDefaultGwInterfaceMTU() int {
 			linkIndex = r.LinkIndex
 		}
 
-		if r.Family == netlink.FAMILY_V4 {
-			if metric < minMetricV4 {
-				minMetricV4 = metric
-				bestLinkV4 = linkIndex
-				hasV4 = true
-			}
-		} else {
-			if metric < minMetricV6 {
-				minMetricV6 = metric
-				bestLinkV6 = linkIndex
-				hasV6 = true
-			}
+		if metric < minMetric {
+			minMetric = metric
+			bestLink = linkIndex
+			found = true
 		}
 	}
-
-	var bestLink int
-	if hasV4 {
-		bestLink = bestLinkV4
-	} else if hasV6 {
-		bestLink = bestLinkV6
-	} else {
-		return 0
-	}
-
-	intfLink, err := netlink.LinkByIndex(bestLink)
-	if err != nil {
-		return 0
-	}
-	return intfLink.Attrs().MTU
+	return bestLink, found
 }
