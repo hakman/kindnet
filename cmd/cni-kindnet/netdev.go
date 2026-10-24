@@ -33,6 +33,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// loopbackIfIndex is the ifindex of lo in every network namespace
+	// (LOOPBACK_IFINDEX in the kernel).
+	loopbackIfIndex = 1
+	// ifAliasMaxLen is the longest alias the kernel accepts (IFALIASZ - 1).
+	ifAliasMaxLen = 255
+)
+
 func createPodInterface(netconf *NetworkConfig) (err error) {
 	iifName := defaultInterface      // veth interface name in the container
 	oofName := netconf.InterfaceName // veth interface name in the host
@@ -62,12 +70,21 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 		unix.NETLINK_ROUTE: {Socket: s},
 	}
 
+	// eth0 is set up as part of the creation: the kernel applies the flags
+	// after both ends are linked, so the open does not fail.
 	msg := nl.NewIfInfomsg(unix.AF_UNSPEC)
+	msg.Flags = unix.IFF_UP
+	msg.Change = unix.IFF_UP
 	req.AddData(msg)
 
 	// internal interface name is always eth0
 	nameData := nl.NewRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(iifName))
 	req.AddData(nameData)
+
+	// set MTU if defined, the kernel applies IFLA_MTU when it creates each end
+	if netconf.MTU > 0 {
+		req.AddData(nl.NewRtAttr(unix.IFLA_MTU, nl.Uint32Attr(uint32(netconf.MTU))))
+	}
 
 	// base namespace is the container namespace
 	val := nl.Uint32Attr(uint32(containerNs))
@@ -78,11 +95,16 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 	linkInfo := nl.NewRtAttr(unix.IFLA_LINKINFO, nil)
 	linkInfo.AddRtAttr(nl.IFLA_INFO_KIND, nl.NonZeroTerminated("veth"))
 
-	// veth interface on the root namespace
+	// veth interface on the root namespace. It can not be set up here:
+	// the kernel applies the peer flags before the peer is linked to eth0,
+	// and opening an unlinked veth fails with ENOTCONN.
 	data := linkInfo.AddRtAttr(nl.IFLA_INFO_DATA, nil)
 	peer := data.AddRtAttr(nl.VETH_INFO_PEER, nil)
 	nl.NewIfInfomsgChild(peer, unix.AF_UNSPEC)
 	peer.AddRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(oofName))
+	if netconf.MTU > 0 {
+		peer.AddRtAttr(unix.IFLA_MTU, nl.Uint32Attr(uint32(netconf.MTU)))
+	}
 
 	valRoot := nl.Uint32Attr(uint32(rootNs))
 	peer.AddRtAttr(unix.IFLA_NET_NS_FD, valRoot)
@@ -105,7 +127,6 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 
 	// veth interface has been created, add routes and addresses now
 
-	// best effort to set the loopback interface up
 	// open a netlink handle on the container namespace to use it directly
 	// and avoid running goroutines inside network namespaces that does not
 	// work fine and require to lock the entire thread.
@@ -117,29 +138,8 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 	if err != nil {
 		return err
 	}
-	loLink, err := nhNs.LinkByName("lo")
-	if err != nil && !errors.Is(err, unix.EINTR) {
-		return fmt.Errorf("could not get interface loopback on namespace %s : %w", netconf.NetNS, err)
-	}
-	_ = nhNs.LinkSetUp(loLink)
-
-	// set up the veth inside the container
-	nsLink, err := nhNs.LinkByName(iifName)
-	if err != nil && !errors.Is(err, unix.EINTR) {
-		return fmt.Errorf("could not get interface %s on namespace %s : %w", iifName, netconf.NetNS, err)
-	}
-
-	// set MTU if defined
-	if netconf.MTU > 0 {
-		err = nhNs.LinkSetMTU(nsLink, netconf.MTU)
-		if err != nil {
-			return fmt.Errorf("could not set interface %s mtu : %w", iifName, err)
-		}
-	}
-
-	if err = nhNs.LinkSetUp(nsLink); err != nil {
-		return fmt.Errorf("failed to set interface %s up: %v", iifName, err)
-	}
+	// best effort to set the loopback interface up, by index without a lookup
+	_ = nhNs.LinkSetUp(&netlink.Device{LinkAttrs: netlink.LinkAttrs{Index: loopbackIfIndex}})
 
 	// DAD has to be disabled to avoid latency on network start
 	if netconf.IPv6 != nil {
@@ -176,36 +176,56 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 		return fmt.Errorf("could not get netlink handle on host : %w", err)
 	}
 
-	hostLink, err := nhRoot.LinkByName(oofName)
-	if err != nil && !errors.Is(err, unix.EINTR) {
-		return fmt.Errorf("could not get interface %s on host : %w", oofName, err)
-	}
-
+	// Set the alias and bring the host side up with one message. The device
+	// is selected by name, so it needs no lookup.
+	hostReq := nl.NewNetlinkRequest(unix.RTM_SETLINK, unix.NLM_F_ACK)
+	hostMsg := nl.NewIfInfomsg(unix.AF_UNSPEC)
+	hostMsg.Flags = unix.IFF_UP
+	hostMsg.Change = unix.IFF_UP
+	hostReq.AddData(hostMsg)
+	hostReq.AddData(nl.NewRtAttr(unix.IFLA_IFNAME, nl.ZeroTerminated(oofName)))
 	// set metadata on the alias field with the pod name and namespace
 	if netconf.Name != "" {
-		err = nhRoot.LinkSetAlias(hostLink, fmt.Sprintf("link-pod %s/%s", netconf.Namespace, netconf.Name))
-		if err != nil {
-			logger.Printf("could not set interface %s alias : %v", oofName, err)
+		alias := fmt.Sprintf("link-pod %s/%s", netconf.Namespace, netconf.Name)
+		// the kernel rejects the whole message if the alias is too long,
+		// so leave it out, as a failed alias did not fail the ADD before
+		if len(alias) <= ifAliasMaxLen {
+			hostReq.AddData(nl.NewRtAttr(unix.IFLA_IFALIAS, []byte(alias)))
+		} else {
+			logger.Printf("could not set interface %s alias : longer than %d bytes", oofName, ifAliasMaxLen)
 		}
 	}
-
-	// set MTU if defined
-	if netconf.MTU > 0 {
-		err = nhRoot.LinkSetMTU(hostLink, netconf.MTU)
-		if err != nil {
-			return fmt.Errorf("could not set interface %s mtu : %w", oofName, err)
-		}
-	}
-
-	if err = nhRoot.LinkSetUp(hostLink); err != nil {
+	if _, err = hostReq.Execute(unix.NETLINK_ROUTE, 0); err != nil {
 		return fmt.Errorf("failed to set interface %s up: %v", oofName, err)
+	}
+
+	// Look up eth0 after both ends are up. The reply carries the host-side
+	// ifindex (IFLA_LINK) and the operstate. Since Linux 6.8 the kernel
+	// applies the pending link event of the queried device before it
+	// answers, so the operstate is UP; older kernels can still report it
+	// as down, and then the wait below polls.
+	nsLink, err := nhNs.LinkByName(iifName)
+	if err != nil && !errors.Is(err, unix.EINTR) {
+		return fmt.Errorf("could not get interface %s on namespace %s : %w", iifName, netconf.NetNS, err)
+	}
+
+	var hostLink netlink.Link
+	if index := nsLink.Attrs().ParentIndex; index > 0 {
+		hostLink = &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: index, Name: oofName}}
+	} else {
+		hostLink, err = nhRoot.LinkByName(oofName)
+		if err != nil && !errors.Is(err, unix.EINTR) {
+			return fmt.Errorf("could not get interface %s on host : %w", oofName, err)
+		}
 	}
 
 	// Wait until the container-side veth is operationally up before adding routes.
 	// A veth reaches OperStateUp only once both ends are up, at which point the
 	// kernel's IPv6 stack is fully initialized and route additions will not race.
-	if err = waitForLinkOperational(nhNs, nsLink.Attrs().Index); err != nil {
-		return fmt.Errorf("interface %s did not become operational: %w", iifName, err)
+	if nsLink.Attrs().OperState != netlink.OperUp {
+		if err = waitForLinkOperational(nhNs, nsLink.Attrs().Index); err != nil {
+			return fmt.Errorf("interface %s did not become operational: %w", iifName, err)
+		}
 	}
 
 	// Configure addresses and routes
