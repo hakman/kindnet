@@ -109,7 +109,11 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 	// open a netlink handle on the container namespace to use it directly
 	// and avoid running goroutines inside network namespaces that does not
 	// work fine and require to lock the entire thread.
-	nhNs, err := netlink.NewHandleAt(containerNs)
+	// Only NETLINK_ROUTE is used, a handle without a family list opens one
+	// socket per supported family.
+	// Keep it that way: the library sends a request of another family
+	// through a new socket in the current network namespace, not in this one.
+	nhNs, err := netlink.NewHandleAt(containerNs, unix.NETLINK_ROUTE)
 	if err != nil {
 		return err
 	}
@@ -167,7 +171,7 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 		}
 	}
 
-	nhRoot, err := netlink.NewHandle()
+	nhRoot, err := netlink.NewHandle(unix.NETLINK_ROUTE)
 	if err != nil {
 		return fmt.Errorf("could not get netlink handle on host : %w", err)
 	}
@@ -216,7 +220,7 @@ func createPodInterface(netconf *NetworkConfig) (err error) {
 		}
 
 		addressGw := &netlink.Addr{IPNet: &net.IPNet{IP: netconf.GWv4, Mask: net.CIDRMask(32, 32)}}
-		err = netlink.AddrAdd(hostLink, addressGw)
+		err = nhRoot.AddrAdd(hostLink, addressGw)
 		if err != nil {
 			return fmt.Errorf("could not add address %s on interface %s : %w", netconf.IPv4.String(), oofName, err)
 		}
@@ -364,8 +368,8 @@ func deletePodInterface(ifName string, netNS string) error {
 		return fmt.Errorf("could not get network namespace from path %s for network device %s : %w", netNS, ifName, err)
 	}
 	// to avoid golang problem with goroutines we create the socket in the
-	// namespace and use it directly
-	nhNs, err := netlink.NewHandleAt(containerNs)
+	// namespace and use it directly, only for NETLINK_ROUTE
+	nhNs, err := netlink.NewHandleAt(containerNs, unix.NETLINK_ROUTE)
 	if err != nil {
 		// namespace no longer exist
 		return nil
