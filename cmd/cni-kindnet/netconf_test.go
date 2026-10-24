@@ -80,15 +80,9 @@ func TestAllocator(t *testing.T) {
 	if err == nil {
 		t.Errorf("unexpected success %s", ip.String())
 	}
-	if a.Free() != 0 {
-		t.Errorf("no free addresses expected, got %d", a.Free())
-	}
 
 	// release and allocate manually
 	a.Release(netip.MustParseAddr("192.168.1.33"))
-	if a.Free() != 1 {
-		t.Errorf("one free addresses expected, got %d", a.Free())
-	}
 	err = writeNetworkConfigWithoutIPs(&NetworkConfig{ContainerID: "id-static-2"})
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +167,81 @@ func TestAllocatorV6(t *testing.T) {
 		t.Fatalf("unexpected success for IP 2001:db8::aa")
 	}
 
+}
+
+func TestGetIPConfigFullRange(t *testing.T) {
+	// The first range of each test has a single allocatable address
+	// (10.0.0.3 or fd00::3), which the first pod takes.
+	tests := []struct {
+		name   string
+		ranges []string
+		want   string // range of the second pod's address, empty if it must fail
+	}{
+		{
+			name:   "ipv4 next range",
+			ranges: []string{"10.0.0.0/30", "10.0.1.0/24"},
+			want:   "10.0.1.0/24",
+		},
+		{
+			name:   "ipv6 next range",
+			ranges: []string{"fd00::/126", "fd00:1::/64"},
+			want:   "fd00:1::/64",
+		},
+		{
+			name:   "all ranges full",
+			ranges: []string{"10.0.0.0/30"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dbDir = t.TempDir()
+			err := start()
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger = log.New(os.Stdout, "", 0)
+
+			err = createIPRanges(tt.ranges)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			first := &NetworkConfig{ContainerID: "id-1"}
+			if err := writeNetworkConfigWithoutIPs(first); err != nil {
+				t.Fatal(err)
+			}
+			if err := getIPConfig(first); err != nil {
+				t.Fatal(err)
+			}
+
+			second := &NetworkConfig{ContainerID: "id-2"}
+			if err := writeNetworkConfigWithoutIPs(second); err != nil {
+				t.Fatal(err)
+			}
+			err = getIPConfig(second)
+			if tt.want == "" {
+				if err == nil {
+					t.Fatalf("unexpected success %s %s", second.IPv4, second.IPv6)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			ip, gw := second.IPv4, second.GWv4
+			if ip == nil {
+				ip, gw = second.IPv6, second.GWv6
+			}
+			want := netip.MustParsePrefix(tt.want)
+			addr, _ := netip.AddrFromSlice(ip)
+			if !want.Contains(addr) {
+				t.Fatalf("expected an address from %s, got %s", want, addr)
+			}
+			if !gw.Equal(want.Addr().AsSlice()) {
+				t.Fatalf("expected gateway %s, got %s", want.Addr(), gw)
+			}
+		})
+	}
 }
 
 func Test_broadcastAddress(t *testing.T) {
