@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -321,5 +322,33 @@ func Test_addOffsetAddress(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAllocateStopsOnDatabaseError(t *testing.T) {
+	dbDir = t.TempDir()
+	err := start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger = log.New(os.Stdout, "", 0)
+
+	err = writeNetworkConfigWithoutIPs(&NetworkConfig{ContainerID: "id-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// every address lookup fails from now on
+	_, err = db.Exec("ALTER TABLE pods RENAME COLUMN ip_address_v4 TO broken")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := NewAllocator(netip.MustParsePrefix("10.0.0.0/24"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Allocate("id-1")
+	if err == nil || !strings.Contains(err.Error(), "checking IP") {
+		t.Fatalf("expected the lookup error, got %v", err)
 	}
 }

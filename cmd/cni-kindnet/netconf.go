@@ -19,6 +19,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -29,6 +30,7 @@ import (
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/mattn/go-sqlite3"
 )
 
 func getInterfaceName() string {
@@ -418,7 +420,7 @@ func ipInsert(ip netip.Addr, cidr netip.Prefix, id string) error {
 `, ip.String(), cidr.Masked().Addr().String(), id)
 	}
 	if err != nil {
-		return fmt.Errorf("error updating container ID and IP %s : %v", cidr.String(), err)
+		return fmt.Errorf("error updating container ID and IP %s : %w", cidr.String(), err)
 	}
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
@@ -487,17 +489,19 @@ func (a *Allocator) Allocate(id string) (netip.Addr, error) {
 		// IP already exist
 		ok, err := ipExists(ip)
 		if err != nil {
-			logger.Printf("error trying to check if ip %s exists : %v", ip.String(), err)
-			continue
+			return netip.Addr{}, fmt.Errorf("checking IP %s: %w", ip, err)
 		}
 		if ok {
 			continue
 		}
 
-		err = ipInsert(ip, a.cidr, id)
-		if err != nil {
-			logger.Printf("error trying to store ip %s: %v", ip.String(), err)
-			continue
+		if err := ipInsert(ip, a.cidr, id); err != nil {
+			var sqliteErr sqlite3.Error
+			if errors.As(err, &sqliteErr) &&
+				sqliteErr.ExtendedCode == sqlite3.ErrConstraintUnique {
+				continue
+			}
+			return netip.Addr{}, err
 		}
 		return ip, nil
 
