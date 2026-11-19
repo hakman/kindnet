@@ -247,36 +247,6 @@ func getIPRanges() ([]netip.Prefix, error) {
 	return cidrs, nil
 }
 
-// IPAddress struct to hold both IPv4 and IPv6 addresses
-type IPAddress struct {
-	IPv4 sql.NullString
-	IPv6 sql.NullString
-}
-
-func listIPAddresses() (ipv4 []string, ipv6 []string, err error) {
-	// Query the database for IPv4 and IPv6 addresses
-	rows, err := db.Query("SELECT ip_address_v4, ip_address_v6 FROM pods")
-	if err != nil {
-		return nil, nil, fmt.Errorf("error querying IP addresses: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var ipAddress IPAddress
-		err := rows.Scan(&ipAddress.IPv4, &ipAddress.IPv6)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error scanning IP address: %w", err)
-		}
-		if ipAddress.IPv4.Valid {
-			ipv4 = append(ipv4, ipAddress.IPv4.String)
-		}
-		if ipAddress.IPv6.Valid {
-			ipv6 = append(ipv6, ipAddress.IPv6.String)
-		}
-	}
-	return
-}
-
 func getIPConfig(netconf *NetworkConfig) error {
 	cidrs, err := getIPRanges()
 	if err != nil {
@@ -295,11 +265,6 @@ func getIPConfig(netconf *NetworkConfig) error {
 		alloc, err := NewAllocator(cidr)
 		if err != nil {
 			logger.Printf("can not allocate addresses from %s : %v", cidr.String(), err)
-			continue
-		}
-
-		// This range is full try other
-		if alloc.Free() == 0 {
 			continue
 		}
 
@@ -488,7 +453,7 @@ func (a *Allocator) Allocate(id string) (netip.Addr, error) {
 		ok, err := ipExists(ip)
 		if err != nil {
 			logger.Printf("error trying to check if ip %s exists : %v", ip.String(), err)
-			continue
+			return netip.Addr{}, err
 		}
 		if ok {
 			continue
@@ -534,36 +499,6 @@ func (a *Allocator) Release(ip netip.Addr) {
 	} else if ip.Is6() {
 		_, _ = db.Exec("DELETE FROM pods WHERE ip_address_v6 = ?", ip.String())
 	}
-}
-
-func (a *Allocator) Free() int {
-	v4s, v6s, err := listIPAddresses()
-	if err != nil {
-		return 0
-	}
-	count := 0
-	if a.cidr.Addr().Is4() {
-		for _, ip := range v4s {
-			addr, err := netip.ParseAddr(ip)
-			if err != nil {
-				continue
-			}
-			if a.cidr.Contains(addr) {
-				count++
-			}
-		}
-	} else if a.cidr.Addr().Is6() {
-		for _, ip := range v6s {
-			addr, err := netip.ParseAddr(ip)
-			if err != nil {
-				continue
-			}
-			if a.cidr.Contains(addr) {
-				count++
-			}
-		}
-	}
-	return int(a.size) - count - a.reserved
 }
 
 // broadcastAddress returns the broadcast address of the subnet

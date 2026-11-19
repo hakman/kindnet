@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -80,15 +81,9 @@ func TestAllocator(t *testing.T) {
 	if err == nil {
 		t.Errorf("unexpected success %s", ip.String())
 	}
-	if a.Free() != 0 {
-		t.Errorf("no free addresses expected, got %d", a.Free())
-	}
 
 	// release and allocate manually
 	a.Release(netip.MustParseAddr("192.168.1.33"))
-	if a.Free() != 1 {
-		t.Errorf("one free addresses expected, got %d", a.Free())
-	}
 	err = writeNetworkConfigWithoutIPs(&NetworkConfig{ContainerID: "id-static-2"})
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +101,25 @@ func TestAllocator(t *testing.T) {
 	ip, err = a.Allocate("id-should-fail-2")
 	if err == nil {
 		t.Errorf("unexpected success %s", ip.String())
+	}
+
+	// the range is full, the address must come from the next one
+	err = createIPRanges([]string{"192.168.1.0/25", "192.168.2.0/24"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := &NetworkConfig{ContainerID: "id-next-range"}
+	err = writeNetworkConfigWithoutIPs(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = getIPConfig(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip, _ = netip.AddrFromSlice(n.IPv4)
+	if !netip.MustParsePrefix("192.168.2.0/24").Contains(ip) {
+		t.Errorf("expected an address from 192.168.2.0/24, got %s", ip)
 	}
 }
 
@@ -173,6 +187,28 @@ func TestAllocatorV6(t *testing.T) {
 		t.Fatalf("unexpected success for IP 2001:db8::aa")
 	}
 
+}
+
+func TestAllocateLookupError(t *testing.T) {
+	dbDir = t.TempDir()
+	err := start()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := NewAllocator(netip.MustParsePrefix("192.168.1.0/29"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// every address lookup fails from now on
+	_, err = db.Exec("DROP TABLE pods")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Allocate("id-1")
+	if err == nil || !strings.Contains(err.Error(), "no such table") {
+		t.Errorf("expected the lookup error, got %v", err)
+	}
 }
 
 func Test_broadcastAddress(t *testing.T) {
